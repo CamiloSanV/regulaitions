@@ -1,0 +1,34 @@
+# ── Environment variables (NEVER commit these) ────────────────────────────────
+.env
+.env.local
+.env.*.local
+frontend/.env.local
+
+# ── Python ─────────────────────────────────────────────────────────────────────
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# ── Generated data (large, regeneratable) ──────────────────────────────────────
+data/pdfs/*.pdf
+output/*.pdf
+evaluation/results/*.json
+
+# ── Node / Next.js ─────────────────────────────────────────────────────────────
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.vercel
+
+# ── OS / Editor ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/
+*.swp
+
+# ── Logs ─────────────────────────────────────────────────────────────────────────
+*.log
+npm-debug.log*
