@@ -4,20 +4,21 @@ rag/retriever.py
 Retrieval híbrido en tres etapas:
   1. Dense retrieval  → pgvector cosine similarity (top-20)
   2. Sparse retrieval → BM25 sobre el mismo corpus (top-20)
-  3. Re-ranking       → CrossEncoder ms-marco (top-5 final)
+  3. Re-ranking       → FlashRank cross-encoder (no torch needed)
 
-El resultado es un retriever compatible con LangChain que
-puedes enchufar directamente al AgentExecutor.
+Uses OpenAI text-embedding-3-small for consistency between local
+development and production (Render). FlashRank replaces the original
+sentence-transformers CrossEncoder to eliminate the torch dependency
+while keeping reranking quality.
 """
 
 import os
 from typing import Optional
 
 from langchain.schema import BaseRetriever, Document
-from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import SupabaseVectorStore
 from langchain_community.retrievers import BM25Retriever
-from sentence_transformers import CrossEncoder
 from supabase import create_client
 from pydantic import Field
 from dotenv import load_dotenv
@@ -25,30 +26,30 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-# ── Singleton de embeddings (carga el modelo una sola vez) ─────────────────────
+# ── Singleton de embeddings ────────────────────────────────────────────────────
 _embeddings_instance = None
 
-def get_embeddings() -> HuggingFaceEmbeddings:
+def get_embeddings() -> OpenAIEmbeddings:
     global _embeddings_instance
     if _embeddings_instance is None:
-        _embeddings_instance = HuggingFaceEmbeddings(
-            model_name="BAAI/bge-m3",
-            model_kwargs={"device": "cpu"},
-            encode_kwargs={"normalize_embeddings": True, "batch_size": 16},
+        _embeddings_instance = OpenAIEmbeddings(
+            model="text-embedding-3-small",
+            dimensions=1536,
         )
     return _embeddings_instance
 
 
-# ── Singleton de re-ranker ─────────────────────────────────────────────────────
+# ── Singleton de re-ranker (FlashRank — no torch required) ────────────────────
 _reranker_instance = None
 
-def get_reranker() -> CrossEncoder:
+def get_reranker():
     global _reranker_instance
     if _reranker_instance is None:
-        # Modelo gratuito, ~70MB, excelente para inglés legal
-        _reranker_instance = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+        from flashrank import Ranker
+        # ms-marco-MiniLM-L-12-v2 is a proven cross-encoder for passage ranking
+        # ~90MB ONNX model, downloads once and caches locally
+        _reranker_instance = Ranker(model_name="ms-marco-MiniLM-L-12-v2")
     return _reranker_instance
-
 
 # ── Retriever híbrido ──────────────────────────────────────────────────────────
 class HybridRegulatoryRetriever(BaseRetriever):
@@ -61,7 +62,7 @@ class HybridRegulatoryRetriever(BaseRetriever):
     Parámetros:
       k_dense:   cuántos docs traer del vector store
       k_sparse:  cuántos docs traer de BM25
-      k_final:   cuántos devolver tras el re-ranking
+      k_final:   cuántos devolver tras la fusión y boost
       filter:    filtro de metadatos (e.g. {"source": "EU_AI_Act"})
     """
 
@@ -70,24 +71,15 @@ class HybridRegulatoryRetriever(BaseRetriever):
     k_final: int = Field(default=5)
     filter: Optional[dict] = Field(default=None)
 
-    # Estos campos se inicializan en setup()
     _vectorstore: Optional[SupabaseVectorStore] = None
     _bm25: Optional[BM25Retriever] = None
-    _reranker: Optional[CrossEncoder] = None
+    _reranker: Optional[object] = None
     _all_docs: list[Document] = []
 
     class Config:
         arbitrary_types_allowed = True
 
     def setup(self, all_docs: list[Document]) -> "HybridRegulatoryRetriever":
-        """
-        Inicializa los componentes con el corpus de documentos.
-        Llama a este método una vez al arrancar la app.
-
-        Uso:
-            docs = load_all_docs_from_supabase()
-            retriever = HybridRegulatoryRetriever().setup(docs)
-        """
         supabase_client = create_client(
             os.getenv("SUPABASE_URL"),
             os.getenv("SUPABASE_KEY"),
@@ -98,7 +90,6 @@ class HybridRegulatoryRetriever(BaseRetriever):
             table_name="documents",
             query_name="match_documents",
         )
-        # BM25 necesita el corpus en memoria (ligero, ~50MB para EU AI Act)
         self._bm25 = BM25Retriever.from_documents(all_docs)
         self._bm25.k = self.k_sparse
         self._reranker = get_reranker()
@@ -167,35 +158,37 @@ class HybridRegulatoryRetriever(BaseRetriever):
 
         # El reranker usa la query EXPANDIDA (terminología densa) ya
         # que el CrossEncoder responde mejor a queries cortas y
-        # específicas que a preguntas largas en lenguaje natural
-        rerank_query = search_query
-        pairs = [(rerank_query, doc.page_content) for doc in candidates]
-        scores = self._reranker.predict(pairs)
+        # ── Etapa 3: Re-ranking con FlashRank ────────────────────
+        # FlashRank uses an ONNX cross-encoder — no torch required,
+        # runs on CPU, scores (query, passage) pairs for relevance.
+        try:
+            from flashrank import RerankRequest
+            reranker = get_reranker()
+            passages = [
+                {"id": i, "text": doc.page_content}
+                for i, doc in enumerate(candidates)
+            ]
+            rerank_req = RerankRequest(query=search_query, passages=passages)
+            rerank_results = reranker.rerank(rerank_req)
+            # rerank_results is sorted by score descending
+            id_to_score = {r["id"]: r["score"] for r in rerank_results}
+            ranked = sorted(
+                candidates,
+                key=lambda d: id_to_score.get(candidates.index(d), 0),
+                reverse=True,
+            )
+        except Exception:
+            # Fallback: position ordering if reranker fails
+            ranked = candidates
 
-        # Ordena por score descendente
-        ranked = sorted(zip(scores, candidates), key=lambda x: x[0], reverse=True)
-
-        # ── Boost: si la query menciona un artículo explícito, ese
-        # artículo se garantiza en el top de resultados, sin importar
-        # su rerank_score. Esto corrige el sesgo del CrossEncoder hacia
-        # frases introductorias genéricas con alto solapamiento léxico.
+        # ── Boost: artículo explícito siempre va primero ─────────
         if explicit_article:
-            explicit_docs = [
-                (score, doc) for score, doc in ranked
-                if doc.metadata.get("article") == explicit_article
-            ]
-            other_docs = [
-                (score, doc) for score, doc in ranked
-                if doc.metadata.get("article") != explicit_article
-            ]
-            # El artículo explícito va primero, el resto completa el top_k
+            explicit_docs = [d for d in ranked if d.metadata.get("article") == explicit_article]
+            other_docs    = [d for d in ranked if d.metadata.get("article") != explicit_article]
             ranked = explicit_docs + other_docs
 
-        top_docs = [doc for _, doc in ranked[: self.k_final]]
-
-        # Añade el score al metadata para transparencia
-        for i, (score, doc) in enumerate(ranked[: self.k_final]):
-            top_docs[i].metadata["rerank_score"] = round(float(score), 4)
+        top_docs = ranked[: self.k_final]
+        for i, doc in enumerate(top_docs):
             top_docs[i].metadata["rank"] = i + 1
             if explicit_article and doc.metadata.get("article") == explicit_article:
                 top_docs[i].metadata["boosted"] = True

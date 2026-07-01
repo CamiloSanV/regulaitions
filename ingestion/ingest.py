@@ -671,11 +671,15 @@ def ingest(source_key: str) -> int:
         console.print(f"  text:       {ex.page_content[:120]}...")
 
     # Step 5: Load embeddings
-    console.print("\n[blue]→[/blue] Loading BGE-M3 embeddings (first run downloads ~1.5GB)...")
-    embeddings = HuggingFaceEmbeddings(
-        model_name="BAAI/bge-m3",
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True, "batch_size": 16},
+    # Using OpenAI text-embedding-3-small for consistency between local
+    # development and production (Render). This avoids torch/sentence-transformers
+    # dependency and ensures the same vector space (1536 dims) everywhere.
+    # Cost: ~$0.001 to embed the full EU AI Act + GDPR corpus.
+    console.print("\n[blue]→[/blue] Loading OpenAI embeddings (text-embedding-3-small)...")
+    from langchain_openai import OpenAIEmbeddings
+    embeddings = OpenAIEmbeddings(
+        model="text-embedding-3-small",
+        dimensions=1536,
     )
 
     # Step 6: Upload to Supabase in batches (with retry on transient network errors)
