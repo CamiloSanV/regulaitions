@@ -18,7 +18,7 @@ beautifulsoup4==4.12.3
 
 # --- Retrieval ---
 rank-bm25==0.2.2
-flashrank==0.2.9        # lightweight cross-encoder reranker, no torch needed
+flashrank==0.2.9
 
 # --- API ---
 fastapi==0.115.5
@@ -31,7 +31,7 @@ datasets==3.1.0
 
 # --- Utilities ---
 python-dotenv==1.0.1
-pydantic==2.9.2
+pydantic>=2.9.2,<3.0.0
 tqdm==4.67.1
 rich==13.9.4
 fpdf2==2.8.1
